@@ -1,0 +1,10 @@
+{
+  "serial_port": "COM3",
+  "baud_rate": 115200,
+  "device_id": "SB-ESP32-001",
+  "api_url": "https://safeband-pulse-guard.base44.app/functions/ingestDeviceData",
+  "api_key": "SB_bridge_7Kx92mQ4vL8pR3zT6Nw",
+  "dry_run": true,
+  "event_dedup_seconds": 20,
+  "post_timeout_seconds": 10
+}
