@@ -1,328 +1,135 @@
-
-import json
-import re
-import sys
-import time
+import json, re, sys, time
 from pathlib import Path
 from datetime import datetime, timezone
-
 import requests
 import serial
 from serial.tools import list_ports
 
-
 ROOT = Path(__file__).resolve().parent
-CONFIG = ROOT / "bridge_config.json"
-
+CONFIG_PATH = ROOT / "bridge_config.json"
 DEFAULTS = {
-    "serial_port": "COM3",
-    "baud_rate": 115200,
-    "device_id": "SB-ESP32-001",
-    "api_url": (
-        "https://safeband-pulse-guard.base44.app/"
-        "functions/ingestDeviceData"
-    ),
-    "api_key": "",
-    "dry_run": True,
-    "event_dedup_seconds": 20,
-    "post_timeout_seconds": 10,
+    "serial_port": "COM7", "baud_rate": 115200, "device_id": "SB-ESP32-001",
+    "api_url": "https://safeband-pulse-guard.base44.app/functions/ingestDeviceData",
+    "api_key": "", "dry_run": True, "location_post_interval_seconds": 5,
+    "event_dedup_seconds": 20, "post_timeout_seconds": 10
 }
 
-
 def load_config():
-    if not CONFIG.exists():
-        raise SystemExit(
-            "Missing bridge_config.json in the project folder."
-        )
-
-    cfg = DEFAULTS.copy()
-    cfg.update(json.loads(CONFIG.read_text(encoding="utf-8")))
-
-    if not cfg["api_key"]:
-        raise SystemExit("Configure your API key privately.")
-
+    if not CONFIG_PATH.exists():
+        raise SystemExit("Missing bridge_config.json. Copy bridge_config.example.json to bridge_config.json first.")
+    try:
+        cfg = DEFAULTS.copy(); cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Could not read bridge_config.json: {exc}")
     if not cfg["api_url"].startswith("https://"):
-        raise SystemExit("The API URL must use HTTPS.")
-
-    if not cfg["dry_run"]:
-        print("LIVE MODE: requests will be sent to Base44.")
-
+        raise SystemExit("api_url must use HTTPS.")
+    if not cfg["dry_run"] and (not cfg.get("api_key") or cfg["api_key"].startswith("PASTE_")):
+        raise SystemExit("Set your rotated API key privately in bridge_config.json.")
     return cfg
 
-
-def now_iso():
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z")
-    )
-
+def timestamp_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 def clean(line):
-    return re.sub(
-        r"^\s*\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\s*->\s*",
-        "",
-        line,
-    ).strip()
+    return re.sub(r"^\s*\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\s*->\s*", "", line).strip()
 
-
-def gps_from(line):
+def parse_location(line):
     patterns = [
-        r"https?://(?:www\.)?maps\.google\.com/\?q="
-        r"(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)",
-
-        r"(?:GPS|Location|Coordinates|Latitude)"
-        r"[^\d-]*(-?\d{1,2}\.\d+)\s*[, ]+\s*"
-        r"(-?\d{1,3}\.\d+)",
+        r"https?://(?:www\.)?maps\.google\.com/\?q=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)",
+        r"https?://(?:www\.)?google\.com/maps\?q=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)",
+        r"\b(?:GPS|Location|Coordinates)\s*[:=]\s*(-?\d{1,2}(?:\.\d+)?)\s*[,; ]+\s*(-?\d{1,3}(?:\.\d+)?)",
+        r"\bLatitude\s*[:=]\s*(-?\d{1,2}(?:\.\d+)?)\s*[,; ]+\s*Longitude\s*[:=]\s*(-?\d{1,3}(?:\.\d+)?)"
     ]
-
     for pattern in patterns:
-        match = re.search(pattern, line, re.I)
-        if not match:
-            continue
-
-        lat = float(match.group(1))
-        lon = float(match.group(2))
-
-        if (
-            -90 <= lat <= 90
-            and -180 <= lon <= 180
-            and (lat != 0 or lon != 0)
-        ):
-            return {"latitude": lat, "longitude": lon}
-
+        m = re.search(pattern, line, re.I)
+        if m:
+            lat, lon = float(m.group(1)), float(m.group(2))
+            if -90 <= lat <= 90 and -180 <= lon <= 180 and (lat != 0 or lon != 0):
+                return {"latitude": lat, "longitude": lon}
     return None
 
-
-def parse_values(line):
-    values = {}
-
-    match = re.search(
-        r"\b(?:Current\s+BPM|Heart\s*Rate|BPM|HR)\s*[:=]\s*(\d{1,3})\b",
-        line,
-        re.I,
-    )
-    if match:
-        bpm = int(match.group(1))
-        if 30 <= bpm <= 220:
-            values["heart_rate"] = bpm
-
-    match = re.search(
-        r"\bSpO\s*[₂2]?\s*[:=]\s*(\d{1,3})\s*%?",
-        line,
-        re.I,
-    )
-    if match:
-        spo2 = int(match.group(1))
-        if 50 <= spo2 <= 100:
-            values["spo2"] = spo2
-
-    match = re.search(
-        r"\bBattery(?:\s+Level)?\s*[:=]\s*(\d{1,3})\s*%?",
-        line,
-        re.I,
-    )
-    if match:
-        battery = int(match.group(1))
-        if 0 <= battery <= 100:
-            values["battery_level"] = battery
-
-    location = gps_from(line)
-    if location:
-        values["location"] = location
-
-    return values
-
-
-def event_from(line):
-    text = line.lower()
-
-    if "alert cancelled by user" in text:
-        return "ALERT_CANCELLED"
-
-    if "standby over - back to normal" in text:
-        return "NORMAL"
-
-    if "alert buffer started:" in text:
-        return "ALERT_BUFFER_STARTED"
-
-    # These lines report delivery/status, not a new emergency.
-    if (
-        "gsm response:" in text
-        or "sms sent successfully" in text
-    ):
-        return None
-
-    # A detection alone must not bypass the 10-second countdown.
-    if "emergency alert" not in text:
-        return None
-
-    if "fall detected" in text:
-        return "FALL_DETECTED"
-
-    if "high bpm" in text:
-        return "HIGH_BPM_ALERT"
-
-    if "button pressed" in text:
-        return "SOS_BUTTON"
-
+def classify_event(line):
+    s = line.lower()
+    if "alert cancelled by user" in s: return "ALERT_CANCELLED"
+    if "standby over - back to normal" in s: return "NORMAL"
+    if "alert buffer started:" in s: return "ALERT_BUFFER_STARTED"
+    if "gsm response:" in s or "sms sent successfully" in s: return None
+    # Only treat a confirmed firmware emergency message as an SOS.
+    if "emergency alert" not in s: return None
+    if "fall detected" in s: return "FALL_DETECTED"
+    if "button pressed" in s or "sos button" in s or "sos pressed" in s: return "SOS_BUTTON"
     return "EMERGENCY_ALERT"
-
 
 class Bridge:
     def __init__(self, cfg):
-        self.cfg = cfg
-        self.session = requests.Session()
-        self.latest_values = {}
-        self.emergency_episode_open = False
-
+        self.cfg=cfg; self.session=requests.Session(); self.last_location=None
+        self.last_location_post=0.0; self.last_event={}; self.emergency_open=False
     def post(self, fields, label):
-        payload = {
-            "device_id": self.cfg["device_id"],
-            "api_key": self.cfg["api_key"],
-            "timestamp": now_iso(),
-            **fields,
-        }
-
-        shown = dict(payload)
-        shown["api_key"] = "***REDACTED***"
-
-        print(f"\n[{label}]")
-        print(json.dumps(shown, indent=2))
-
-        if self.cfg["dry_run"]:
-            print("[DRY RUN] Not sent to Base44.")
-            return True
-
+        payload={"device_id":self.cfg["device_id"], "timestamp":timestamp_iso(), **fields}
+        if self.cfg.get("api_key"): payload["api_key"]=self.cfg["api_key"]
+        shown=dict(payload)
+        if "api_key" in shown: shown["api_key"]="***REDACTED***"
+        print(f"\n[{label}]\n"+json.dumps(shown,indent=2))
+        if self.cfg.get("dry_run", True):
+            print("[DRY RUN] Not sent to Base44."); return True
         try:
-            response = self.session.post(
-                self.cfg["api_url"],
-                json=payload,
-                timeout=int(self.cfg["post_timeout_seconds"]),
-            )
-
-            print(f"Base44 HTTP {response.status_code}")
-            response.raise_for_status()
-
-            try:
-                result = response.json()
-                print("Base44 response:", json.dumps(result)[:800])
-            except ValueError:
-                print("Base44 returned a non-JSON response.")
-
+            r=self.session.post(self.cfg["api_url"],json=payload,timeout=int(self.cfg["post_timeout_seconds"]))
+            print("Base44 HTTP",r.status_code); r.raise_for_status()
+            try: result=r.json(); print("Base44 response:",json.dumps(result)[:1200])
+            except ValueError: print("Non-JSON response; saving is unconfirmed."); return False
+            if isinstance(result,dict) and result.get("success") is False: return False
+            if label == "GPS LOCATION" and isinstance(result,dict) and result.get("location_saved") is False:
+                print("ERROR: backend says location_saved=false; check backend schema."); return False
             return True
-
-        except requests.RequestException as error:
-            print("Base44 POST failed:", error)
-            return False
-
+        except requests.RequestException as e:
+            print("Base44 POST failed:",e); return False
     def handle(self, raw):
-        line = clean(raw)
-        if not line:
-            return
-
-        print("[ESP32]", line)
-
-        values = parse_values(line)
-        self.latest_values.update(values)
-
-        # Partial sensor updates must not clear an active SOS.
-        if values:
-            self.post(values, "SENSOR DATA")
-
-        event = event_from(line)
+        line=clean(raw)
+        if not line: return
+        print("[ESP32]",line)
+        loc=parse_location(line)
+        if loc:
+            now=time.monotonic(); interval=max(1,int(self.cfg.get("location_post_interval_seconds",5)))
+            if loc != self.last_location or now-self.last_location_post >= interval:
+                fields={"location":loc,"latitude":loc["latitude"],"longitude":loc["longitude"],"event_type":"LOCATION_UPDATE"}
+                # Do not force NORMAL status on every GPS update; avoid clearing active SOS.
+                if self.post(fields,"GPS LOCATION"):
+                    self.last_location=loc; self.last_location_post=now
+        event=classify_event(line)
         if not event:
+            if any(w in line.lower() for w in ("gps","location","latitude","longitude")) and not loc:
+                print("[INFO] GPS-like line but no coordinates parsed. Expected: GPS: 16.5062, 80.6480")
             return
-
         if event == "ALERT_BUFFER_STARTED":
-            print(
-                "[INFO] Countdown started. "
-                "Waiting for confirmation after the countdown."
-            )
+            print("[INFO] Countdown started; waiting for confirmed emergency."); return
+        if event in ("ALERT_CANCELLED","NORMAL"):
+            if self.post({"status":"NORMAL","is_sos_active":False,"event_type":event},event): self.emergency_open=False
             return
-
-        if event in ("ALERT_CANCELLED", "NORMAL"):
-            success = self.post(
-                {
-                    "status": "NORMAL",
-                    "is_sos_active": False,
-                    "event_type": event,
-                },
-                event,
-            )
-
-            if success:
-                self.emergency_episode_open = False
-            return
-
-        # Fall/BPM/button events from the same incident should not
-        # create repeated emergency updates.
-        if self.emergency_episode_open:
-            print("[INFO] Duplicate emergency suppressed:", event)
-            return
-
-        emergency_fields = {
-            **self.latest_values,
-            "status": "EMERGENCY",
-            "is_sos_active": True,
-            "event_type": event,
-        }
-
-        if self.post(emergency_fields, event):
-            self.emergency_episode_open = True
-
+        now=time.monotonic(); dedup=max(0,int(self.cfg.get("event_dedup_seconds",20)))
+        if now-self.last_event.get(event,0) < dedup:
+            print("[INFO] Duplicate event suppressed:",event); return
+        if self.emergency_open:
+            print("[INFO] Emergency already active; duplicate suppressed:",event); return
+        fields={"status":"EMERGENCY","is_sos_active":True,"event_type":event}
+        if self.last_location: fields.update({"location":self.last_location,"latitude":self.last_location["latitude"],"longitude":self.last_location["longitude"]})
+        if self.post(fields,event): self.emergency_open=True; self.last_event[event]=now
 
 def main():
-    cfg = load_config()
-
-    print("SafeBand Serial Bridge")
-    print("Device:", cfg["device_id"])
-    print("Endpoint:", cfg["api_url"])
-    print("Dry run:", cfg["dry_run"])
-
-    ports = list(list_ports.comports())
-    print(
-        "Detected ports:",
-        ", ".join(
-            f"{port.device} ({port.description})"
-            for port in ports
-        ) or "none",
-    )
-
-    bridge = Bridge(cfg)
-
+    cfg=load_config(); print("SafeBand GPS + SOS Serial Bridge")
+    print("Device:",cfg["device_id"]); print("Endpoint:",cfg["api_url"]); print("Dry run:",cfg["dry_run"])
+    ports=list(list_ports.comports())
+    print("Detected ports:",", ".join(f"{p.device} ({p.description})" for p in ports) or "none")
     try:
-        with serial.Serial(
-            cfg["serial_port"],
-            int(cfg["baud_rate"]),
-            timeout=1,
-        ) as connection:
-            time.sleep(2)
-            connection.reset_input_buffer()
-
-            print(
-                f"Listening on {cfg['serial_port']} "
-                f"at {cfg['baud_rate']} baud. Ctrl+C to stop."
-            )
-
+        with serial.Serial(cfg["serial_port"],int(cfg["baud_rate"]),timeout=1) as conn:
+            time.sleep(2); conn.reset_input_buffer()
+            print(f"Listening on {cfg['serial_port']} at {cfg['baud_rate']} baud. Ctrl+C to stop.")
+            print("Waiting for GPS coordinates or confirmed SOS messages...")
+            bridge=Bridge(cfg)
             while True:
-                raw = connection.readline()
-                if raw:
-                    bridge.handle(
-                        raw.decode("utf-8", errors="replace")
-                    )
+                raw=conn.readline()
+                if raw: bridge.handle(raw.decode("utf-8",errors="replace"))
+    except KeyboardInterrupt: print("\nBridge stopped.")
+    except serial.SerialException as e:
+        print("Serial connection failed:",e); print("Check COM port/cable; close Arduino Serial Monitor first."); sys.exit(2)
 
-    except KeyboardInterrupt:
-        print("\nBridge stopped.")
-
-    except serial.SerialException as error:
-        print("Serial connection failed:", error)
-        print(
-            "Check the COM port, USB cable and driver. "
-            "Close Arduino Serial Monitor before starting the bridge."
-        )
-        sys.exit(2)
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
