@@ -5,6 +5,7 @@
   "api_url": "https://safeband-pulse-guard.base44.app/functions/ingestDeviceData",
   "api_key": "SB_bridge_7Kx92mQ4vL8pR3zT6Nw",
   "dry_run": false,
+  "location_post_interval_seconds": 5,
   "event_dedup_seconds": 20,
   "post_timeout_seconds": 10
 }
